@@ -1,0 +1,168 @@
+name: Docker
+
+on:
+  schedule:
+    - cron: '27 18 * * *'   # daily; rebuild only if upstream latest digest changed
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force rebuild even if upstream unchanged"
+        type: boolean
+        default: false
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  # Track Tailscale's image on GHCR:
+  UPSTREAM_OWNER: tailscale
+  UPSTREAM_IMAGE: tailscale
+  UPSTREAM_TAG: latest
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Compute GHCR repo (lowercase)
+        id: repo
+        run: echo "repo=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve upstream digest from GHCR (canonical)
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          OWNER="${UPSTREAM_OWNER}"
+          NAME="${UPSTREAM_IMAGE}"
+          TAG="${UPSTREAM_TAG}"
+
+          TOKEN="$(curl -fsSL "https://ghcr.io/token?scope=repository:${OWNER}/${NAME}:pull" | jq -r '.token')"
+          [ -n "$TOKEN" ] || { echo "Failed to get GHCR token"; exit 1; }
+
+          DIGEST="$(curl -fsSLI \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/${OWNER}/${NAME}/manifests/${TAG}" \
+            | tr -d '\r' \
+            | awk -F': ' 'tolower($1)=="docker-content-digest" {print $2; exit}')"
+          [ -n "$DIGEST" ] || { echo "Failed to resolve upstream digest from GHCR"; exit 1; }
+
+          SAFE_TAG="$(echo "$DIGEST" | tr ':' '-')"
+          echo "digest=${DIGEST}"             >> "$GITHUB_OUTPUT"
+          echo "immutable_tag=ts-${SAFE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Decide if build is needed
+        id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+          NEEDS_BUILD=false
+
+          # Manual run can force
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force }}" = "true" ]; then
+            NEEDS_BUILD=true
+          fi
+
+          # For scheduled (and non-forced) runs: build only if immutable tag missing
+          if [ "$NEEDS_BUILD" = "false" ]; then
+            if ! docker manifest inspect "${REGISTRY}/${{ steps.repo.outputs.repo }}:${{ steps.upstream.outputs.immutable_tag }}" >/dev/null 2>&1; then
+              NEEDS_BUILD=true
+            fi
+          fi
+
+          echo "needs_build=${NEEDS_BUILD}" >> "$GITHUB_OUTPUT"
+          echo "Build needed? ${NEEDS_BUILD}"
+
+      # Heavy steps only if building
+      - name: Checkout
+        if: steps.decide.outputs.needs_build == 'true'
+        uses: actions/checkout@v4
+
+      - name: Setup QEMU (for arm64)
+        if: steps.decide.outputs.needs_build == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Buildx
+        if: steps.decide.outputs.needs_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: GHCR login (owner, not actor)
+        if: steps.decide.outputs.needs_build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (tags & labels)
+        if: steps.decide.outputs.needs_build == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.repo.outputs.repo }}
+          # Add our immutable digest-based tag alongside normal tags
+          tags: |
+            type=raw,value=${{ steps.upstream.outputs.immutable_tag }}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+            type=sha
+          labels: |
+            org.opencontainers.image.base.name=ghcr.io/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_IMAGE }}:${{ env.UPSTREAM_TAG }}
+            org.opencontainers.image.base.digest=${{ steps.upstream.outputs.digest }}
+
+      - name: Build & push
+        if: steps.decide.outputs.needs_build == 'true'
+        id: build-and-push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: ${{ env.PLATFORMS }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install cosign
+        if: steps.decide.outputs.needs_build == 'true'
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.2.4'
+
+      - name: Capture pushed digest (from buildx output)
+        if: steps.decide.outputs.needs_build == 'true'
+        id: digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="${{ steps.build-and-push.outputs.digest || '' }}"
+          if [ -z "$D" ]; then
+            echo "Buildx did not return a digest"; exit 1
+          fi
+          D="$(printf '%s' "$D" | tr -d '\r\n\t ')"
+          echo "digest=$D" >> "$GITHUB_OUTPUT"
+          echo "Resolved digest from build step: $D"
+
+      - name: Sign pushed image (cosign keyless, digest subject)
+        if: steps.decide.outputs.needs_build == 'true'
+        env:
+          REPO: ${{ steps.repo.outputs.repo }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          DIGEST="$(printf '%s' "$DIGEST" | tr -d '\r\n\t ')"
+          echo "Signing ghcr.io/${REPO}@${DIGEST}"
+          cosign sign --yes "ghcr.io/${REPO}@${DIGEST}"
